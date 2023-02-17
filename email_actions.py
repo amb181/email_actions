@@ -1,7 +1,6 @@
 import win32com.client
 import os
 import sys
-import time
 import pandas as pd
 
 
@@ -13,14 +12,15 @@ class Outlook:
         self.o_filter = o_filter
 
         # Creating an object for the outlook application.
-        self.outlook = win32com.client.Dispatch(
-            "Outlook.Application"
-        ).GetNamespace("MAPI")
+        self.outlook = win32com.client.Dispatch("Outlook.Application")
+
+        self.ns = self.outlook.GetNamespace("MAPI")
 
         # Creating an object to access outlook folder
-        self.inbox = self.outlook.Folders[self.o_mailbox].Folders[
-            self.o_folder
-        ]
+        if self.o_mailbox == " ":
+            self.inbox = self.ns.GetDefaultFolder(6)
+        else:
+            self.inbox = self.ns.Folders[self.o_mailbox].Folders[self.o_folder]
 
         # Filter email
         raw_messages = self.inbox.Items
@@ -29,15 +29,8 @@ class Outlook:
         self.messages = filteredEmails
 
     def close(self):
-        # get all running instances of MAPI
-        self.sessions = self.outlook.Session.GetSharedDefaultFolder
-
-        # close all sessions of MAPI
-        for session in self.sessions:
-            session.Logoff()
-
-        # quit the MAPI application
-        self.outlook.Quit()
+        # close the MAPI object
+        self.outlook.Application.Quit()
 
     def get_messages(self):
         # Columns for dataframe
@@ -65,14 +58,25 @@ class Outlook:
             cc = message.CC
             subject = message.Subject
             body = message.Body.replace("\n", " ").replace("\t", " ")
-            html_body = message.HTMLBody
+            html_body = message.HTMLBody.replace("\n", " ").replace("\t", " ")
             attachments_raw = message.Attachments
             attachments = [att.FileName for att in attachments_raw]
             attachments_count = len(attachments)
             received = message.ReceivedTime.strftime("%m/%d/%y %H:%M:%S")
             sent = message.SentOn.strftime("%m/%d/%y %H:%M:%S")
             sender = message.SenderName
+            # Format sender email
             sender_add = message.SenderEmailAddress
+            try:
+                sender_add = self.ns.CreateRecipient(sender_add)
+                sender_add.Resolve()
+                sender_address_entry = sender_add.AddressEntry
+                exchange_user = sender_address_entry.GetExchangeUser()
+                sender_add = exchange_user.PrimarySmtpAddress
+            except:
+                pass
+
+            # End
             unread = message.UnRead
 
             new_row = [
