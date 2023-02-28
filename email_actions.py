@@ -5,6 +5,7 @@ TENARIS SOLUTIONS 2023.
 """
 import argparse
 import win32com.client
+import pythoncom
 import os
 import re
 import pandas as pd
@@ -15,20 +16,40 @@ class Outlook:
     def __init__(self, o_mailbox, o_folder) -> None:
         self.o_mailbox = o_mailbox
         self.o_folder = o_folder
-
+        # Init COM object
+        pythoncom.CoInitialize()
         # Creating an object for the outlook application.
         self.outlook = win32com.client.Dispatch("Outlook.Application")
         self.ns = self.outlook.GetNamespace("MAPI")
 
+        # Update Inbox items
+        # self.ns.SendAndReceive(False) # Updates all mailboxes
+        sync_objects = self.ns.SyncObjects
+        for sync_object in sync_objects:
+            if sync_object.Name == self.o_mailbox:
+                # Synchronize the folder hierarchy and items for the mailbox
+                sync_object.SyncFolderHierarchy()
+                sync_object.SyncFolderItems(self.inbox)
+                # wait for the sync operation to complete
+                while sync_object.SyncState != 0:
+                    pythoncom.PumpWaitingMessages()
+                break
+
         # Creating an object to access outlook folder
         if self.o_mailbox:
-            self.inbox = self.ns.Folders[self.o_mailbox].Folders[self.o_folder]
+            if self.o_folder:
+                self.inbox = self.ns.Folders[self.o_mailbox].Folders[
+                    self.o_folder
+                ]
+            else:
+                shared_mailbox = self.ns.CreateRecipient(o_mailbox)
+                shared_mailbox.Resolve()
+                self.inbox = self.ns.GetSharedDefaultFolder(shared_mailbox, 6)
         else:
-            self.inbox = self.ns.GetDefaultFolder(6)
-        # Update inbox
-        self.inbox.GetTable()
-        # Getting folder email items
-        self.messages = self.inbox.Items
+            if self.o_folder:
+                self.inbox = self.ns.GetDefaultFolder(6).Folders[o_folder]
+            else:
+                self.inbox = self.ns.GetDefaultFolder(6)
 
     # Auxiliar functions
     def close(self):
@@ -43,9 +64,7 @@ class Outlook:
         return string
 
     def format_email_add(self, email_add):
-        address = self.ns.CreateRecipient(email_add)
-        address.Resolve()
-        address_entry = address.AddressEntry
+        address_entry = email_add.AddressEntry
         exchange_user = address_entry.GetExchangeUser()
         email_add = exchange_user.PrimarySmtpAddress
 
@@ -57,7 +76,8 @@ class Outlook:
     def get_emails(self, o_filter, folder_path):
         self.o_filter = o_filter
 
-        # Filter email
+        # Getting folder email items
+        self.messages = self.inbox.Items
         filteredEmails = self.messages.Restrict(self.o_filter)
         # Creating an object to access items inside the inbox of outlook.
         self.messages = filteredEmails
@@ -138,7 +158,7 @@ class Outlook:
             df_rows.append(verified_row)
 
         df = pd.DataFrame(df_rows, columns=df_columns)
-        df.to_excel(f"{folder_path}\\df.xlsx", index=False, encoding="utf-8")
+        df.to_excel(f"{folder_path}/df.xlsx", index=False, encoding="utf-8")
 
     # Get attachments
     def get_attachments(self, o_id, o_store_id, folder_path, pattern):
@@ -154,13 +174,13 @@ class Outlook:
                 ):
                     try:
                         attachment.SaveAsFile(
-                            f"{folder_path}\\{str(attachment)}"
+                            f"{folder_path}/{str(attachment)}"
                         )
 
                     except Exception as ex:
                         print(ex.args)
                         try:
-                            os.remove(f"{folder_path}\\{str(attachment)}")
+                            os.remove(f"{folder_path}/{str(attachment)}")
                         except:
                             pass
 
@@ -196,10 +216,25 @@ class Outlook:
     ):
         message = self.ns.GetItemFromID(o_id, o_store_id)
         reply = message.Reply()
+        importance = "Low"
+        if message.Importance == 1:
+            importance = "Normal"
+        elif message.Importance == 2:
+            importance = "High"
+
+        traceback = f"<html><body><br><b>From</b>: {message.Sender}\n<br><b>Sent</b>: {message.SentOn}\n<br><b>To</b>: {message.To}\n<br><b>Cc</b>: {message.CC}\n<br><b>Subject</b>: {message.Subject}\n<br><b>Importance</b>: {importance}\n\n</body></html>"
         if o_body:
-            reply.Body = o_body
+            traceback = (
+                traceback.replace("<b>", "")
+                .replace("</b>", "")
+                .replace("<html><body>", "")
+                .replace("</body></html>", "")
+            )
+            reply.Body = f"{o_body}\n\n{traceback}\n{message.Body}"
         else:
-            reply.HTMLBody = o_html_body
+            reply.HTMLBody = (
+                f"{o_html_body}\n\n{traceback}\n{message.HTMLBody}"
+            )
         # Add attachments if any
         if o_att_path:
             for path in o_att_path:
@@ -208,11 +243,11 @@ class Outlook:
         reply.Send()
 
     # Save email as file
-    def save_email(self, o_id, folder_path):
+    def save_email(self, o_id, o_store_id, folder_path):
         message = self.ns.GetItemFromID(o_id, o_store_id)
-        filename = re.sub("\W", message.Subject)
+        filename = re.sub("\W", "_", message.Subject)
         try:
-            message.SaveAs(f"{folder_path}\\{filename}.msg")
+            message.SaveAs(os.path.join(folder_path, f"{filename}.msg"))
         except Exception as ex:
             print(ex.args)
             pass
@@ -220,7 +255,11 @@ class Outlook:
     # Move email to folder
     def move_email(self, o_id, o_store_id, o_new_folder):
         message = self.ns.GetItemFromID(o_id, o_store_id)
-        new_folder = self.ns.Folders[self.o_mailbox].Folders[o_new_folder]
+        new_folder = ""
+        if self.o_mailbox:
+            new_folder = self.ns.Folders[self.o_mailbox].Folders[o_new_folder]
+        else:
+            new_folder = self.ns.GetDefaultFolder(6).Folders[o_new_folder]
         message.Move(new_folder)
 
     # Mark email item as read
@@ -242,21 +281,21 @@ if __name__ == "__main__":
     today = datetime.now()
     # Yesterday date
     yesterday = (
-        (today - timedelta(days=1))
-        .strftime("X%m-X%d-%Y")
+        (today - timedelta(days=3))
+        .strftime("%Y-X%m-X%d")
         .replace("X0", "")
         .replace("X", "")
     )
-    today = today.strftime("X%m-X%d-%Y").replace("X0", "").replace("X", "")
+    today = today.strftime("%Y-X%m-X%d").replace("X0", "").replace("X", "")
 
     # Set arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("--mailbox", help="Mailbox", default=None)
     parser.add_argument(
-        "--mailbox_folder", help="Mailbox folder", default="Inbox"
+        "--mailbox_folder", help="Mailbox folder", default=None
     )
     parser.add_argument(
-        "--mailbox_new_folder", help="Mailbox new folder", default="Inbox"
+        "--mailbox_new_folder", help="Mailbox new folder", default=None
     )
     parser.add_argument(
         "--mail_filter",
@@ -266,7 +305,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--folder_path",
         help="Folder path",
-        default=f"C:\\Users\\{user}\\Downloads",
+        default=f"C:/Users/{user}/Downloads",
     )
     parser.add_argument("--email_action", help="Email action", default=None)
     parser.add_argument("--email_id", help="Email ID", default=None)
@@ -323,8 +362,8 @@ if __name__ == "__main__":
         os.makedirs(folder_path)
 
     # Delete error txt if exists
-    if os.path.exists(f"{folder_path}\\error.txt"):
-        os.remove(f"{folder_path}\\error.txt")
+    if os.path.exists(f"{folder_path}/error.txt"):
+        os.remove(f"{folder_path}/error.txt")
 
     # Attempt to run script only 3 times
     while attempts < 4:
@@ -354,7 +393,7 @@ if __name__ == "__main__":
         # Catch exception
         except Exception as ex:
             print(f"Exception: {ex}\n\n")
-            with open(f"{folder_path}\\error.txt", "w", encoding="utf-8") as f:
+            with open(f"{folder_path}/error.txt", "w", encoding="utf-8") as f:
                 f.write(str(ex))
                 attempts += 1
                 pass
@@ -362,7 +401,7 @@ if __name__ == "__main__":
         # Action if completed successfully
         else:
             with open(
-                f"{folder_path}\\get_mail.txt", "w", encoding="utf-8"
+                f"{folder_path}/get_mail.txt", "w", encoding="utf-8"
             ) as f:
                 f.write("Done")
                 print("Done!")
